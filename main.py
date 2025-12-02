@@ -27,8 +27,60 @@ such as the maximum number of pages to scrape, the delay between requests, the d
 file for storing the scraped data, and whether to display detailed output during the scraping.
 """
 
+# Import standard library modules
+import os
+
 # Import the avherald_scraper module
 from avherald_scraper import avherald_scraper
+import dotenv
+
+# Default configuration values (used if the environment does not override them)
+DEFAULT_MAX_PAGES_TO_SCRAPE = 20
+DEFAULT_REQUEST_DELAY_SECONDS = 3
+DEFAULT_SHOW_DETAILS = True
+
+
+def _load_int_from_env(env_key, default):
+	"""
+	Returns an integer pulled from the environment or the provided default.
+	"""
+	value = os.getenv(env_key)
+	if value is None:
+		return default
+	try:
+		return int(value)
+	except ValueError:
+		print(f"Warning: Invalid integer for {env_key}='{value}'. Falling back to {default}.")
+		return default
+
+
+def _load_bool_from_env(env_key, default):
+	"""
+	Returns a boolean pulled from the environment or the provided default.
+	"""
+	value = os.getenv(env_key)
+	if value is None:
+		return default
+	lower_value = value.strip().lower()
+	if lower_value in {"1", "true", "yes", "on"}:
+		return True
+	if lower_value in {"0", "false", "no", "off"}:
+		return False
+	print(f"Warning: Invalid boolean for {env_key}='{value}'. Falling back to {default}.")
+	return default
+
+
+def _build_scrape_kwargs():
+	"""
+	Computes the keyword arguments for avherald_scraper.scrape() using env overrides.
+	"""
+	env_path = dotenv.find_dotenv('.env', False)
+	dotenv.load_dotenv(env_path)
+	return {
+		"max_pages_to_scrape": _load_int_from_env("MAX_PAGES_TO_SCRAPE", DEFAULT_MAX_PAGES_TO_SCRAPE),
+		"request_delay_seconds": _load_int_from_env("REQUEST_DELAY_SECONDS", DEFAULT_REQUEST_DELAY_SECONDS),
+		"show_details": _load_bool_from_env("SHOW_DETAILS", DEFAULT_SHOW_DETAILS)
+	}
 
 
 def main():
@@ -39,15 +91,8 @@ def main():
 	from the avherald_scraper module with specified configuration parameters.
 	"""
 
-	# Call the scrape function with specified parameters
-	avherald_scraper.scrape(
-		# Specify the maximum number of pages to scrape
-		max_pages_to_scrape=1,
-		# Specify the delay in seconds between requests
-		request_delay_seconds=3,
-		# Specify whether to show detailed output
-		show_details=True
-	)
+	# Call the scrape function with computed parameters
+	avherald_scraper.scrape(**_build_scrape_kwargs())
 
 
 # Check if the script is being run as the main module

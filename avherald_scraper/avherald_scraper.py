@@ -52,6 +52,13 @@ import calendar
 
 from requests import Session
 
+from avherald_scraper.aircraft_models import AIRCRAFT_MODEL_NAMES
+
+
+class AvHeraldAccessError(RuntimeError):
+	"""Raised when avherald.com denies access to the headlines."""
+	pass
+
 env_path = dotenv.find_dotenv('.env', False)
 
 # if not os.path.exists(env_path):
@@ -88,6 +95,401 @@ DATE_REGEX = re.compile(DATE_REGEX_STR)
 
 # Compile the regular expression for removing ordinal suffixes.
 ORDINAL_SUFFIX_REGEX = re.compile(r"(?<=\d)(st|nd|rd|th)")
+
+# Regex to detect the location preposition to isolate the aircraft/airline segment.
+LOCATION_SPLIT_REGEX = re.compile(
+	r'\b(?:at|near|over|enroute to|en route to)\b',
+	re.IGNORECASE
+)
+
+# Keywords that strongly indicate the beginning of an aircraft description.
+AIRCRAFT_KEYWORDS = {
+	"aerospatiale",
+	"agusta",
+	"airbus",
+	"airtractor",
+	"antonov",
+	"atr",
+	"avro",
+	"bae",
+	"beechcraft",
+	"bell",
+	"boeing",
+	"bombardier",
+	"britten",
+	"caravan",
+	"cessna",
+	"dash",
+	"challenger",
+	"cirrus",
+	"citation",
+	"comac",
+	"crj",
+	"dassault",
+	"diamond",
+	"dhc",
+	"dornier",
+	"douglas",
+	"embraer",
+	"falcon",
+	"fairchild",
+	"fokker",
+	"gulfstream",
+	"helicopter",
+	"ilyushin",
+	"learjet",
+	"let",
+	"lockheed",
+	"mcdonnell",
+	"mitsubishi",
+	"mooney",
+	"otter",
+	"pilatus",
+	"piper",
+	"robinson",
+	"saab",
+	"sikorsky",
+	"sukhoi",
+	"superjet",
+	"tecnam",
+	"tupolev",
+	"ultralight",
+	"yakovlev"
+}
+
+# Multi-word aircraft descriptors that should be treated as a single unit.
+AIRCRAFT_MULTIWORD_PATTERNS = [
+	("king", "air"),
+	("twin", "otter"),
+	("grand", "caravan"),
+	("britten", "norman")
+]
+
+# Pre-computed lookup of normalized aircraft model names for boundary detection.
+_AIRCRAFT_MODEL_LOOKUP = {
+	re.sub(r'[^a-z0-9]', '', name.lower()): name for name in AIRCRAFT_MODEL_NAMES
+}
+
+# Maximum number of tokens to consider when matching multi-word aircraft names.
+_AIRCRAFT_MODEL_MAX_TOKENS = 6
+
+# Words that typically follow the aircraft type and should terminate parsing.
+AIRCRAFT_STOPWORDS = {
+	"enroute", "en-route", "inflight", "taxi", "taxiing", "departing",
+	"departed", "arrival", "arriving", "landing", "takeoff", "take-off",
+	"climbed", "descending", "descended", "without", "with", "after",
+	"before", "during", "from", "to", "over", "near", "at", "on", "while",
+	"when", "and", "due", "because", "following", "shortly", "short",
+	"long", "approach", "runway", "stand", "gate"
+}
+
+# Regex used to detect conjunctions that may separate multiple aircraft subjects.
+SUBJECT_CONJUNCTION_REGEX = re.compile(r'\s+(?:and|&)\s+', re.IGNORECASE)
+
+# Prefix applied to secondary records when a headline describes multiple aircraft.
+SECONDARY_TITLE_PREFIX = "[标记"
+
+# Canonical schema definition for the incidents table.
+_INCIDENT_TABLE_COLUMNS_SQL = """
+        category TEXT,
+        title TEXT UNIQUE,
+        airline TEXT,
+        aircraft TEXT,
+        timestamp INTEGER,
+        url TEXT
+    """
+
+_DESIRED_INCIDENT_COLUMNS = (
+	"category",
+	"title",
+	"airline",
+	"aircraft",
+	"timestamp",
+	"url"
+)
+
+# Characters to strip from tokens when trying to identify aircraft boundaries.
+_TOKEN_STRIP_CHARS = " ,.;()/[]{}"
+
+
+def _format_response_preview(response_text, max_lines=5):
+	"""
+	Returns a preview string containing only the first `max_lines` of the HTTP response.
+	"""
+	if not response_text:
+		return "<empty response>"
+	lines = response_text.splitlines()
+	preview = "\n".join(lines[:max_lines])
+	if len(lines) > max_lines:
+		preview += "\n..."
+	return preview
+
+
+def _ensure_not_blocked(response_text):
+	"""
+	Raises an informative error if the response indicates that the IP is blocked.
+	"""
+	block_indicators = [
+		"Your IP address",
+		"has been used for unauthorized accesses",
+		"therefore blocked"
+	]
+	lower_text = response_text.lower()
+	if all(phrase.lower() in lower_text for phrase in block_indicators):
+		raise AvHeraldAccessError(
+			"avherald.com returned an access-block page for this IP. "
+			"Please retry from a different network or contact The Aviation Herald."
+		)
+
+
+def _normalize_aircraft_token(token):
+	"""
+	Normalizes tokens for aircraft detection by stripping punctuation.
+	"""
+	return token.strip(_TOKEN_STRIP_CHARS)
+
+
+def _normalize_model_key(text):
+	"""
+	Produces a comparable key for aircraft model names.
+	"""
+	return re.sub(r'[^a-z0-9]', '', text.lower())
+
+
+def _tokens_are_manufacturers(tokens):
+	"""
+	Checks whether all tokens describe aircraft manufacturers/series.
+	"""
+	if not tokens:
+		return False
+	for token in tokens:
+		stripped = _normalize_aircraft_token(token).lower()
+		if not stripped or stripped not in AIRCRAFT_KEYWORDS:
+			return False
+	return True
+
+
+def _token_matches_aircraft(token):
+	"""
+	Determines whether a token is likely to start an aircraft description.
+	"""
+	if not token:
+		return False
+	lower_token = token.lower()
+	if lower_token in AIRCRAFT_KEYWORDS:
+		return True
+	alphanumeric = re.sub(r'[^A-Za-z0-9]', '', token)
+	if len(alphanumeric) < 3:
+		return False
+	return any(char.isalpha() for char in alphanumeric) and any(char.isdigit() for char in alphanumeric)
+
+
+def _find_aircraft_start_index(raw_tokens, stripped_tokens, lowered_tokens):
+	"""
+	Finds the index where the aircraft description likely begins.
+	"""
+	model_index = _find_aircraft_start_by_model(raw_tokens)
+	if model_index is not None:
+		return model_index
+	for pattern in AIRCRAFT_MULTIWORD_PATTERNS:
+		size = len(pattern)
+		for idx in range(len(lowered_tokens) - size + 1):
+			segment = lowered_tokens[idx:idx + size]
+			if segment == list(pattern):
+				return idx
+	for idx, token in enumerate(stripped_tokens):
+		if _token_matches_aircraft(token):
+			return idx
+	return None
+
+
+def _find_aircraft_start_by_model(raw_tokens):
+	"""
+	Finds aircraft start index by scanning for known aircraft models.
+	"""
+	for idx in range(len(raw_tokens)):
+		if _match_known_aircraft_tokens(raw_tokens[idx:]):
+			return idx
+	return None
+
+
+def _match_known_aircraft_tokens(raw_tokens):
+	"""
+	Returns the slice of tokens that matches a known aircraft model.
+	"""
+	sanitized_tokens = [_normalize_aircraft_token(token) for token in raw_tokens]
+	max_len = min(len(sanitized_tokens), _AIRCRAFT_MODEL_MAX_TOKENS)
+	for length in range(max_len, 0, -1):
+		segment = sanitized_tokens[:length]
+		if not all(segment):
+			continue
+		key = _normalize_model_key(" ".join(segment))
+		if key in _AIRCRAFT_MODEL_LOOKUP:
+			return raw_tokens[:length]
+	return None
+
+
+def _trim_aircraft_tokens(raw_tokens):
+	"""
+	Removes trailing descriptive words from the aircraft token list.
+	"""
+	if not raw_tokens:
+		return raw_tokens
+	known_match = _match_known_aircraft_tokens(raw_tokens)
+	if known_match:
+		return known_match
+	trimmed = []
+	for token in raw_tokens:
+		stripped = _normalize_aircraft_token(token)
+		lowered = stripped.lower()
+		if stripped and lowered in AIRCRAFT_STOPWORDS and trimmed:
+			break
+		trimmed.append(token)
+	return trimmed if trimmed else raw_tokens
+
+
+def _split_subject_chunks(subject):
+	"""
+	Splits a subject string into chunks delimited by conjunctions like 'and' or '&'.
+	"""
+	if not subject:
+		return []
+	chunks = SUBJECT_CONJUNCTION_REGEX.split(subject)
+	return [chunk.strip(" ,;/") for chunk in chunks if chunk and chunk.strip(" ,;/")]
+
+
+def _parse_subject_chunk(chunk):
+	"""
+	Parses a single subject chunk into airline and aircraft strings.
+	"""
+	raw_tokens = chunk.split()
+	if not raw_tokens:
+		return "Unknown", "Unknown"
+	stripped_tokens = [_normalize_aircraft_token(token) for token in raw_tokens]
+	lowered_tokens = [token.lower() for token in stripped_tokens]
+	aircraft_start = _find_aircraft_start_index(raw_tokens, stripped_tokens, lowered_tokens)
+	if aircraft_start is None:
+		return "Unknown", chunk.strip()
+	airline_tokens = raw_tokens[:aircraft_start]
+	manufacturer_prefix = _tokens_are_manufacturers(airline_tokens)
+	aircraft_tokens = raw_tokens[aircraft_start:]
+	if manufacturer_prefix:
+		airline = "Unknown"
+		aircraft_tokens = airline_tokens + aircraft_tokens
+		numeric_prefix_tokens = []
+	else:
+		alpha_tokens = [token for token in airline_tokens if any(char.isalpha() for char in token)]
+		airline = " ".join(alpha_tokens).strip()
+		numeric_prefix_tokens = []
+		if not airline:
+			airline = "Unknown"
+			numeric_prefix_tokens = [token for token in airline_tokens if not any(char.isalpha() for char in token)]
+		if numeric_prefix_tokens:
+			aircraft_tokens = numeric_prefix_tokens + aircraft_tokens
+	aircraft_tokens = _trim_aircraft_tokens(aircraft_tokens)
+	aircraft = " ".join(token for token in aircraft_tokens).strip(" ,.;") or "Unknown"
+	return airline, aircraft
+
+
+def _chunks_are_valid(parsed_chunks):
+	"""
+	Determines whether the parsed chunks represent distinct, valid aircraft entries.
+	"""
+	if len(parsed_chunks) < 2:
+		return False
+	return all(aircraft != "Unknown" for _, aircraft in parsed_chunks)
+
+
+def _extract_subject_segment(clean_title):
+	"""
+	Returns the portion of the cleaned title that precedes the location indicator.
+	"""
+	if not clean_title:
+		return ""
+	match = LOCATION_SPLIT_REGEX.search(clean_title)
+	if match:
+		return clean_title[:match.start()].strip()
+	return clean_title.strip()
+
+
+def _extract_aircraft_entries(clean_title):
+	"""
+	Returns a list of (airline, aircraft) tuples from the cleaned incident title.
+	"""
+	subject = _extract_subject_segment(clean_title)
+	if not subject:
+		return [("Unknown", "Unknown")]
+	chunks = _split_subject_chunks(subject)
+	if chunks:
+		parsed_chunks = [_parse_subject_chunk(chunk) for chunk in chunks]
+		if _chunks_are_valid(parsed_chunks):
+			return parsed_chunks
+	# Fallback to parsing the entire subject as a single chunk.
+	return [_parse_subject_chunk(subject or clean_title)]
+
+
+def _build_variant_title(original_title, airline, variant_index):
+	"""
+	Builds a title for secondary entries to keep database titles unique.
+	"""
+	if variant_index == 0:
+		return original_title
+	suffix = airline if airline != "Unknown" else f"#{variant_index + 1}"
+	return f"{SECONDARY_TITLE_PREFIX} {suffix}] {original_title}"
+
+
+def _get_incident_columns(conn):
+	"""
+	Returns the current column order for the incidents table.
+	"""
+	result = conn.execute("PRAGMA table_info(incidents);")
+	return [row[1] for row in result.fetchall()]
+
+
+def _has_desired_incident_schema(columns):
+	"""
+	Determines if the incidents table already matches the desired schema.
+	"""
+	desired = list(_DESIRED_INCIDENT_COLUMNS)
+	if not columns:
+		return False
+	if columns == desired:
+		return True
+	return len(columns) == len(desired) and set(columns) == set(desired)
+
+
+def _ensure_latest_schema(conn):
+	"""
+	Ensures the incidents table contains only the desired columns.
+	"""
+	columns = _get_incident_columns(conn)
+	if not columns:
+		return
+	if _has_desired_incident_schema(columns):
+		return
+	_migrate_incidents_table(conn, columns)
+
+
+def _migrate_incidents_table(conn, existing_columns):
+	"""
+	Rebuilds the incidents table to match the desired schema while preserving data.
+	"""
+	temp_table = "incidents_legacy"
+	conn.execute(f"ALTER TABLE incidents RENAME TO {temp_table};")
+	conn.execute(f"""
+        CREATE TABLE incidents (
+{_INCIDENT_TABLE_COLUMNS_SQL}
+        );
+    """)
+	columns_to_copy = [col for col in _DESIRED_INCIDENT_COLUMNS if col in existing_columns]
+	if columns_to_copy:
+		column_csv = ", ".join(columns_to_copy)
+		conn.execute(
+			f"INSERT INTO incidents ({column_csv}) SELECT {column_csv} FROM {temp_table};"
+		)
+	conn.execute(f"DROP TABLE {temp_table};")
+	conn.commit()
+
 
 # Create the output directory from the database file path.
 output_directory = os.path.dirname(DATABASE_FILE_PATH)
@@ -132,67 +534,45 @@ def date_to_timestamp(date_string, show_details=False):
 #
 # @param original_title The original title string to process.
 # @param show_details Whether to print details if parsing fails.
-# @return A dict with keys: 'cleaned_title', 'cause', 'date_string', 'location'
+# @return A dict with keys: 'title', 'timestamp', 'airline', 'aircraft'
 def process_title(original_title, show_details=False):
 	# Strip leading/trailing whitespace from the title.
 	title = original_title.strip()
-	# Initialize the result dictionary.
-	result = {}
 
-	# Find the last comma in the title.
-	last_comma = title.rfind(',')
-	# Check if a comma was found.
-	if last_comma != -1:
-		# Extract the cause from the title.
-		cause = title[last_comma + 1:].strip()
-		# Check if the cause is not empty.
-		if cause:
-			# Capitalize the first letter of the cause.
-			cause = cause[0].upper() + cause[1:]
-		# Add the cause to the result dictionary.
-		result['cause'] = cause
-		# Update the title to exclude the cause.
-		title = title[:last_comma].strip()
-	# If no comma was found.
+	# Remove any trailing descriptive clauses (often after the first comma).
+	if ',' in title:
+		title_for_parsing = title.split(',', 1)[0].strip()
 	else:
-		# Set the cause to "Not specified".
-		result['cause'] = "Not specified"
+		title_for_parsing = title
 
 	# Search for a date in the title.
-	date_match = DATE_REGEX.search(title)
+	date_match = DATE_REGEX.search(title_for_parsing)
 	# Check if a date was found.
 	if date_match:
 		# Extract the date string.
 		date_str = date_match.group(0)
 		# Convert the date string to a timestamp.
-		result['timestamp'] = date_to_timestamp(date_str, show_details=show_details)
+		timestamp = date_to_timestamp(date_str, show_details=show_details)
 		# Create a date segment string to remove from the title.
 		date_segment = " on " + date_str
 		# Remove the date segment from the title.
-		title = title.replace(date_segment, "").strip()
+		title_for_parsing = title_for_parsing.replace(date_segment, "").strip()
 	# If no date was found.
 	else:
 		# Set the timestamp to None.
-		result['timestamp'] = None
+		timestamp = None
 
-	# Search for a location in the original title.
-	location_match = re.search(
-		r'\b(?:at|near|over|enroute to)\s+([A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*)*)',
-		original_title
-	)
-	# Check if a location was found.
-	if location_match:
-		# Extract the location.
-		result['location'] = location_match.group(1).strip()
-	# If no location was found.
-	else:
-		# Set the location to "Unknown".
-		result['location'] = "Unknown"
-
-	# Set the cleaned title in the result dictionary.
-	result['cleaned_title'] = title
-	# Return the result dictionary.
-	return result
+	entries = []
+	pairs = _extract_aircraft_entries(title_for_parsing)
+	for idx, (airline, aircraft) in enumerate(pairs):
+		entry_title = _build_variant_title(title, airline, idx)
+		entries.append({
+			'title': entry_title,
+			'timestamp': timestamp,
+			'airline': airline,
+			'aircraft': aircraft
+		})
+	return entries
 
 
 #
@@ -207,56 +587,46 @@ def scrape_single_page(page_url, show_details=False):
 		# Print the URL being scraped.
 		print(f"Attempting to scrape: {page_url}")
 
-	# Try to fetch the page content.
+	# Remove or keep proxy settings commented as not in use
+	# username = "fiPGJc7Sg"
+	# password = "01GDK78135NM0F00KS5RV5TSYX"
+	# proxy_host = "hk-hkg01-ike.provpn.world"
+	# proxies = { ... }
+
+	session = requests.Session()
+	session.trust_env = False  # Ensure system proxies are ignored
+
+	# Add realistic headers to mimic a browser
+	headers = {
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.188 Safari/537.36"
+	}
+
 	try:
-		# Remove or keep proxy settings commented as not in use
-		# username = "fiPGJc7Sg"
-		# password = "01GDK78135NM0F00KS5RV5TSYX"
-		# proxy_host = "hk-hkg01-ike.provpn.world"
-		# proxies = { ... }
-
-		session = requests.Session()
-		session.trust_env = False  # Ensure system proxies are ignored
-
-		# Add realistic headers to mimic a browser
-		headers = {
-			"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.188 Safari/537.36"
-		}
-
-		response = None  # Initialize response to safely handle failures
-		try:
-			response = session.get(page_url, headers=headers, timeout=10)
-			response.raise_for_status()
-			if show_details:
-				print("Response received:", response.text)
-		except requests.exceptions.RequestException as e:
-			print("Request failed:", e)
-		except Exception as outer_error:
-			print("An unexpected error occurred:", outer_error)
-
-	# Catch a Timeout exception.
+		response = session.get(page_url, headers=headers, timeout=10)
+		response.raise_for_status()
 	except requests.exceptions.Timeout:
-		# Check if details should be shown.
 		if show_details:
-			# Print an error message if the request timed out.
 			print(f"Error: Request timed out for {page_url}. Skipping this page.")
-		# Return an empty list and None for the next page URL.
 		return [], None
-	# Catch any other request exception.
 	except requests.exceptions.RequestException as e:
-		# Check if details should be shown.
 		if show_details:
-			# Print an error message if there was an error fetching the URL.
 			print(f"Error fetching URL {page_url}: {e}. Skipping this page.")
-		# Return an empty list and None for the next page URL.
+		else:
+			print(f"Error fetching URL {page_url}: {e}")
 		return [], None
+
+	html_text = response.text
+	if show_details:
+		preview = _format_response_preview(html_text, max_lines=5)
+		print("Response received (first 5 lines):\n" + preview)
+	_ensure_not_blocked(html_text)
 
 	# Check if details should be shown.
 	if show_details:
 		# Print a message indicating that the page content was successfully fetched.
 		print("Successfully fetched page content. Parsing HTML...")
 	# Parse the HTML content using BeautifulSoup.
-	soup = BeautifulSoup(response.text, 'lxml')
+	soup = BeautifulSoup(html_text, 'lxml')
 	# Initialize an empty list to store incidents found on the page.
 	page_incidents = []
 	# Find all headline spans on the page.
@@ -277,8 +647,6 @@ def scrape_single_page(page_url, show_details=False):
 	else:
 		# Iterate over each headline span.
 		for headline_span in headline_spans:
-			# Initialize an empty dictionary to store incident details.
-			incident = {}
 			# Find the parent <a> tag of the headline span.
 			link_tag = headline_span.find_parent('a')
 			# Check if the <a> tag exists and has an 'href' attribute.
@@ -306,29 +674,27 @@ def scrape_single_page(page_url, show_details=False):
 					else:
 						# Set the category to the filename.
 						category = filename
-			# Set the category in the incident dictionary.
-			incident['category'] = category
-
 			# Extract the original title from the headline span and strip whitespace.
 			original_title = headline_span.text.strip()
 			# Process the title to extract relevant information.
-			parsed = process_title(original_title, show_details=show_details)
-			# Set the cleaned title in the incident dictionary.
-			incident['title'] = parsed['cleaned_title']
-			# Set the location in the incident dictionary.
-			incident['location'] = parsed['location']
-			# Set the cause in the incident dictionary.
-			incident['cause'] = parsed['cause']
-			# Set the timestamp in the incident dictionary.
-			incident['timestamp'] = parsed['timestamp']
+			parsed_entries = process_title(original_title, show_details=show_details)
 
 			# Extract the relative URL from the <a> tag.
 			relative_url = link_tag['href']
 			# Create the absolute URL by joining the base URL and the relative URL.
-			incident['url'] = urljoin(BASE_URL, relative_url)
+			absolute_url = urljoin(BASE_URL, relative_url)
 
-			# Add the incident dictionary to the list of page incidents.
-			page_incidents.append(incident)
+			for entry in parsed_entries:
+				incident = {
+					'category': category,
+					'title': entry['title'],
+					'airline': entry['airline'],
+					'aircraft': entry['aircraft'],
+					'timestamp': entry['timestamp'],
+					'url': absolute_url
+				}
+				# Add the incident dictionary to the list of page incidents.
+				page_incidents.append(incident)
 
 	# Initialize the next page URL to None.
 	next_page_url = None
@@ -361,20 +727,16 @@ def scrape_single_page(page_url, show_details=False):
 # @param conn The database connection object.
 def create_table_if_not_exists(conn):
 	# Define the SQL query to create the 'incidents' table if it doesn't exist.
-	sql = """
+	sql = f"""
     CREATE TABLE IF NOT EXISTS incidents (
-        category TEXT,
-        title TEXT UNIQUE,
-        location TEXT,
-        cause TEXT,
-        timestamp INTEGER,
-        url TEXT
+{_INCIDENT_TABLE_COLUMNS_SQL}
     );
     """
 	# Execute the SQL query.
 	conn.execute(sql)
 	# Commit the changes to the database.
 	conn.commit()
+	_ensure_latest_schema(conn)
 
 
 #
@@ -391,7 +753,7 @@ def insert_incident(conn, incident):
 
 	# Define the SQL query to insert an incident into the database, ignoring duplicates.
 	sql = """
-    INSERT OR IGNORE INTO incidents (category, title, location, cause, timestamp, url)
+    INSERT OR IGNORE INTO incidents (category, title, airline, aircraft, timestamp, url)
     VALUES (?, ?, ?, ?, ?, ?);
     """
 	# Execute the SQL query with the incident data.
@@ -399,8 +761,8 @@ def insert_incident(conn, incident):
 		sql, (
 			incident['category'],
 			incident['title'],
-			incident['location'],
-			incident['cause'],
+			incident['airline'],
+			incident['aircraft'],
 			incident['timestamp'],
 			incident['url']
 		)

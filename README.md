@@ -19,12 +19,14 @@ This script is provided as a **proof of concept** and is intended **only for edu
 *   **📰 Headline Scraping**: Extracts incident headlines from the avherald.com front page.
 *   **📊 Data Extraction**: Parses key details from headlines:
     *   Incident Category (e.g., `crash`, `incident`, `news`)
-    *   Cleaned Title
-    *   Approximate Location (if mentioned)
-    *   Suspected Cause/Type (if mentioned)
+    *   Original Headline (stored verbatim)
+    *   Operating Airline (if mentioned)
+    *   Aircraft Type or Fleet (if mentioned)
+        *   Uses a curated catalog of aircraft models to trim trailing descriptive text
     *   Incident Date (converted to timestamp)
     *   Direct URL to the full report on avherald.com
-*   **💾 Local Storage**: Saves extracted data into a local SQLite database (`./output/data.sqlite` by default).
+*   **✂️ Multi-Aircraft Headlines**: If a single headline references multiple aircraft (e.g., “Airline A XXX and Airline B YYY …”), the scraper now emits one row per aircraft. Secondary rows keep the original headline but are prefixed with `[标记 Airline]` so they remain unique in the database.
+*   **💾 Local Storage**: Saves extracted data—including airline and aircraft metadata—into a local SQLite database (`./output/data.sqlite` by default).
 *   **🚫 Duplicate Prevention**: Avoids adding duplicate entries based on the incident title.
 *   **⚙️ Configurable**: Allows easy configuration of:
     *   Number of pages to scrape (`MAX_PAGES_TO_SCRAPE`).
@@ -68,12 +70,12 @@ You should see `(venv)` at the beginning of your terminal prompt.
 
 ## ⚙️ Configuration
 
-Before running the script, you can adjust its behavior by editing the constants at the top of the `main.py` file:
+Runtime behavior is now controlled via environment variables (or a `.env` file in the project root). The defaults are the values shown below:
 
-*   `MAX_PAGES_TO_SCRAPE`: (*int*) How many pages of avherald.com to scrape[^1] (e.g., `1` for only the front page, `3` for the first three pages). **Default**: `1`.
+*   `MAX_PAGES_TO_SCRAPE`: (*int*) How many pages of avherald.com to scrape[^1] (e.g., `1` for only the front page, `3` for the first three pages). **Default**: `20`.
 *   `REQUEST_DELAY_SECONDS`: (*int*) Number of seconds to wait between fetching pages. Helps prevent getting blocked. **Default**: `3`.
-*   `DATABASE_FILE`: (*string*) Path where the SQLite database file will be created/updated. **Default**: `'./output/data.sqlite'`.
-*   `SHOW_DETAILS`: (*bool*) Set to `True` to print detailed progress messages during scraping, or `False` to run silently. **Default**: `False`.
+*   `SHOW_DETAILS`: (*bool*) Set to `True` to print detailed progress messages during scraping, or `False` to run silently. **Default**: `True`.
+*   `DATABASE_FILE_PATH`: (*string*) Path where the SQLite database file will be created/updated. **Default**: `'./output/data.sqlite'` (configured in `.env` and used inside the scraper).
 
 ## ▶️ Usage
 
@@ -93,13 +95,26 @@ The script will:
 4.  Fetch and parse headlines for the number of pages specified by `MAX_PAGES_TO_SCRAPE`, pausing between pages according to `REQUEST_DELAY_SECONDS`.
 5.  Insert any *new* incidents found into the database. Duplicates (based on title) will be ignored.
 6.  Print progress if `SHOW_DETAILS` is `True`.
+7.  Abort early with a clear error message if avherald.com responds with an IP-block notice (instead of silently writing an empty database).
 
 ### Example: Daily Update Cron Job
 
 You can set up a cron job (on Linux/macOS) or a scheduled task (on Windows) to run the script once every 24 hours (recommended) and only fetch the latest incidents from the front page, thus reducing unnecessary server load for avherald.com's servers.
 
-1.  Edit `main.py` and set `MAX_PAGES_TO_SCRAPE = 1`.
+1.  Set `MAX_PAGES_TO_SCRAPE=1` in your `.env` (or export it in the shell).
 2.  [Set up a cron job](https://phoenixnap.com/kb/set-up-cron-job-linux) to execute the `python main.py` command using the correct **absolute paths** for your Python executable (within the `venv/bin` directory) and the script.
+
+### Database Analysis Helper
+
+Use the standalone analyzer to summarize how many entries each airline or aircraft type has:
+
+```bash
+python analyze_database.py --mode both --limit 20
+python analyze_database.py --mode airline
+python analyze_database.py --mode aircraft --database ./output/other.sqlite
+```
+
+All commands honor `DATABASE_FILE_PATH` from `.env` by default.
 
 ## 🧪 Testing
 

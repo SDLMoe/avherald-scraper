@@ -1,3 +1,5 @@
+import pytest
+
 import avherald_scraper.avherald_scraper as avherald_scraper
 
 
@@ -22,39 +24,70 @@ def test_process_title_with_all_fields():
 	# Defines a title string with all fields present.
 	title = "Boeing 737 at Berlin on Mar 31st 2025, engine failure"
 	# Processes the title string using the process_title function.
-	result = avherald_scraper.process_title(title)
-	# Asserts that the cleaned title is extracted correctly.
-	assert result['cleaned_title'] == "Boeing 737 at Berlin"
-	# Asserts that the cause is extracted correctly.
-	assert result['cause'] == "Engine failure"
-	# Asserts that the location is extracted correctly.
-	assert result['location'] == "Berlin"
+	results = avherald_scraper.process_title(title)
+	assert len(results) == 1
+	result = results[0]
+	# Asserts that the stored title remains unchanged.
+	assert result['title'] == "Boeing 737 at Berlin on Mar 31st 2025, engine failure"
 	# Asserts that the timestamp is extracted and converted correctly.
 	assert result['timestamp'] == 1743379200
+	# Asserts that airline/aircraft defaults are set.
+	assert result['airline'] == "Unknown"
+	assert result['aircraft'] == "Boeing 737"
 
 
-# Defines a test case for process_title when the location is missing.
-def test_process_title_without_location():
+# Ensures airline and aircraft information can be extracted.
+def test_process_title_extracts_airline_and_aircraft():
+	title = "Ryanair B738 at Dublin on Mar 31st 2025, tail strike"
+	results = avherald_scraper.process_title(title)
+	result = results[0]
+	assert result['airline'] == "Ryanair"
+	assert result['aircraft'] == "B738"
+
+
+def test_process_title_airline_followed_by_model():
+	title1 = "Jet2 B738 at Bristol on Nov 11th 2025, wing tip strike on go around"
+	title2 = "Cityjet CRJX at Frankfurt on Sep 28th 2025, smoke on board"
+	result1 = avherald_scraper.process_title(title1)[0]
+	result2 = avherald_scraper.process_title(title2)[0]
+	assert result1['airline'] == "Jet2"
+	assert result1['aircraft'] == "B738"
+	assert result2['airline'] == "Cityjet"
+	assert result2['aircraft'] == "CRJX"
+
+
+# Ensures multi-aircraft headlines are split into separate entries.
+def test_process_title_splits_multiple_aircraft():
+	title = "Canada BCS3 and United B38M at San Francisco on Jun 24th 2025, ATC operational error"
+	results = avherald_scraper.process_title(title)
+	assert len(results) == 2
+	assert results[0]['airline'] == "Canada"
+	assert results[0]['aircraft'] == "BCS3"
+	assert results[0]['title'] == title
+	assert results[1]['airline'] == "United"
+	assert results[1]['aircraft'] == "B38M"
+	assert results[1]['title'].startswith("[标记")
+	assert title in results[1]['title']
+
+
+# Defines a test case for process_title without explicit location keywords.
+def test_process_title_without_location_keywords():
 	# Defines a title string without location.
 	title = "Airbus A320 on Mar 31st 2025, bird strike"
 	# Processes the title string using the process_title function.
-	result = avherald_scraper.process_title(title)
-	# Asserts that the location is set to "Unknown" when it's missing from the title.
-	assert result['location'] == "Unknown"
-	# Asserts that the cause is extracted correctly.
-	assert result['cause'] == "Bird strike"
+	result = avherald_scraper.process_title(title)[0]
+	# Asserts that the airline falls back to Unknown when none is given.
+	assert result['airline'] == "Unknown"
+	# Asserts that the aircraft is still captured.
+	assert result['aircraft'] == "Airbus A320"
 
 
-# Defines a test case for process_title when the cause is missing.
-def test_process_title_without_cause():
-	# Defines a title string without cause.
-	title = "Cessna 172 at Paris on Jan 1st 2020"
-	# Processes the title string using the process_title function.
-	result = avherald_scraper.process_title(title)
-	# Asserts that the cause is set to "Not specified" when it's missing from the title.
-	assert result['cause'] == "Not specified"
-	# Asserts that the location is extracted correctly.
-	assert result['location'] == "Paris"
+# Ensures trailing descriptive words are trimmed from the aircraft type.
+def test_process_title_cleans_trailing_aircraft_words():
+	title = "THY A332 enroute on Aug 31st 2025, climbed without clearance, loss of separation"
+	result = avherald_scraper.process_title(title)[0]
+	assert result['airline'] == "THY"
+	assert result['aircraft'] == "A332"
 
 
 # Defines a test case for process_title when the date is missing.
@@ -62,13 +95,11 @@ def test_process_title_without_date():
 	# Defines a title string without date.
 	title = "Piper PA-28 at London, gear up landing"
 	# Processes the title string using the process_title function.
-	result = avherald_scraper.process_title(title)
+	result = avherald_scraper.process_title(title)[0]
 	# Asserts that the timestamp is None when the date is missing.
 	assert result['timestamp'] is None
-	# Asserts that the location is extracted correctly.
-	assert result['location'] == "London"
-	# Asserts that the cause is extracted correctly.
-	assert result['cause'] == "Gear up landing"
+	# Asserts that the aircraft is captured.
+	assert result['aircraft'] == "Piper PA-28"
 
 
 # Defines a test case for process_title with minimal information.
@@ -76,13 +107,12 @@ def test_process_title_minimal():
 	# Defines a minimal title string.
 	title = "Unknown incident"
 	# Processes the title string using the process_title function.
-	result = avherald_scraper.process_title(title)
-	# Asserts that the cause is set to "Not specified" when the title is minimal.
-	assert result['cause'] == "Not specified"
-	# Asserts that the location is set to "Unknown" when the title is minimal.
-	assert result['location'] == "Unknown"
+	result = avherald_scraper.process_title(title)[0]
 	# Asserts that the timestamp is None when the title is minimal.
 	assert result['timestamp'] is None
+	# Asserts that both airline and aircraft default to Unknown text.
+	assert result['airline'] == "Unknown"
+	assert result['aircraft'] == "Unknown incident"
 
 
 # Defines a test case for insert_incident and insert_incidents functions.
@@ -99,10 +129,10 @@ def test_insert_incident_and_insert_incidents(tmp_path):
 		'category':  'incident',
 		# Defines the title of the incident.
 		'title':     'Test Title',
-		# Defines the location of the incident.
-		'location':  'Test Location',
-		# Defines the cause of the incident.
-		'cause':     'Test Cause',
+		# Defines the airline storing information.
+		'airline':   'Test Airline',
+		# Defines the aircraft storing information.
+		'aircraft':  'Test Aircraft',
 		# Defines the timestamp of the incident.
 		'timestamp': 1234567890,
 		# Defines the URL of the incident.
@@ -159,18 +189,94 @@ def test_scrape_single_page(monkeypatch):
 		# Defines a mock method to simulate raising an exception for bad status codes.
 		def raise_for_status(self): pass
 
-	# Defines a mock function for simulating HTTP GET requests.
-	def mock_get(*args, **kwargs):
-		# Returns a MockResponse object with the defined HTML content.
-		return MockResponse(html)
+	# Defines a mock session for simulating HTTP GET requests.
+	class MockSession:
+		def __init__(self):
+			self.trust_env = True
 
-	# Uses monkeypatch to replace the requests.get function with the mock_get function.
-	monkeypatch.setattr(avherald_scraper.requests, "get", mock_get)
+		def get(self, *args, **kwargs):
+			return MockResponse(html)
+
+	# Uses monkeypatch to replace the requests.Session class with MockSession.
+	monkeypatch.setattr(avherald_scraper.requests, "Session", MockSession)
 	# Scrapes a single page using the mock HTTP response.
 	incidents, next_url = avherald_scraper.scrape_single_page("http://fakeurl", show_details=False)
 	# Asserts that the number of incidents scraped is 1.
 	assert len(incidents) == 1
-	# Asserts that the title of the scraped incident is correct.
-	assert incidents[0]['title'] == "Boeing 737 at Berlin"
+	# Asserts that the title of the scraped incident is preserved.
+	assert incidents[0]['title'] == "Boeing 737 at Berlin on Mar 31st 2025, engine failure"
+	# Asserts airline/aircraft parsing values.
+	assert incidents[0]['airline'] == "Unknown"
+	assert incidents[0]['aircraft'] == "Boeing 737"
 	# Asserts that the next URL extracted is correct.
 	assert next_url.endswith("/nextpage")
+
+
+def test_scrape_single_page_multiple_entries(monkeypatch):
+	html = """
+    <html>
+    <body>
+        <table>
+            <tr>
+                <td><img src="incident.gif"></td>
+                <td>
+                    <a href="/article1">
+                        <span class="headline_avherald">Canada BCS3 and United B38M at San Francisco on Jun 24th 2025, ATC operational error</span>
+                    </a>
+                </td>
+            </tr>
+        </table>
+    </body>
+    </html>
+    """
+
+	class MockResponse:
+		def __init__(self, text):
+			self.text = text
+			self.status_code = 200
+
+		def raise_for_status(self):
+			return None
+
+	class MockSession:
+		def __init__(self):
+			self.trust_env = True
+
+		def get(self, *args, **kwargs):
+			return MockResponse(html)
+
+	monkeypatch.setattr(avherald_scraper.requests, "Session", MockSession)
+
+	incidents, next_url = avherald_scraper.scrape_single_page("http://fakeurl", show_details=False)
+	assert len(incidents) == 2
+	assert incidents[0]['airline'] == "Canada"
+	assert incidents[0]['aircraft'] == "BCS3"
+	assert incidents[1]['airline'] == "United"
+	assert incidents[1]['aircraft'] == "B38M"
+	assert incidents[1]['title'].startswith("[标记")
+	assert incidents[0]['title'].endswith("ATC operational error")
+	assert next_url is None
+
+
+def test_scrape_single_page_detects_ip_block(monkeypatch):
+	html = "<html><body><p>Your IP address 1.2.3.4 has been used for unauthorized accesses and is therefore blocked!</p></body></html>"
+
+	class MockResponse:
+		def __init__(self, text):
+			self.text = text
+			self.status_code = 200
+
+		def raise_for_status(self):
+			return None
+
+	class MockSession:
+		def __init__(self):
+			self.trust_env = True
+
+		def get(self, *args, **kwargs):
+			return MockResponse(html)
+
+	monkeypatch.setattr(avherald_scraper.requests, "Session", MockSession)
+
+	with pytest.raises(avherald_scraper.AvHeraldAccessError):
+		avherald_scraper.scrape_single_page("http://fakeurl", show_details=False)
